@@ -1,0 +1,538 @@
+openapi: 3.0.3
+info:
+  title: ScamWatch API
+  version: 1.0.0
+  description: |
+    Community scam reporting with moderation, and a risk assessment endpoint that scores phone numbers,
+    UPI IDs, emails, URLs and bank accounts.
+
+    Responses use the envelope `{ success, data, meta? }` on success and `{ success: false, error: { code, message, details? } }` on failure.
+servers:
+  - url: /api
+tags:
+  - name: Auth
+  - name: Reports
+  - name: Community
+  - name: Risk
+  - name: Stats
+  - name: Moderation
+  - name: Admin
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, example: 665f1c2e8a1b2c3d4e5f6a7b }
+    EvidenceId:
+      name: evidenceId
+      in: path
+      required: true
+      schema: { type: string }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 50, default: 10 }
+  schemas:
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        error:
+          type: object
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  message: { type: string }
+    IdentifierKind:
+      type: string
+      enum: [phone, upi, email, url, bank_account]
+    ScamType:
+      type: string
+      enum: [phishing, upi_fraud, kyc_fraud, fake_job, lottery, investment, loan_app, romance, tech_support, impersonation, online_shopping, other]
+    Identifier:
+      type: object
+      required: [kind, value]
+      properties:
+        kind: { $ref: '#/components/schemas/IdentifierKind' }
+        value: { type: string, example: refund.support@okaxis }
+    ReportInput:
+      type: object
+      required: [scamType, title, description, identifier]
+      properties:
+        scamType: { $ref: '#/components/schemas/ScamType' }
+        title: { type: string, minLength: 8, maxLength: 120 }
+        description: { type: string, minLength: 30, maxLength: 3000 }
+        identifier: { $ref: '#/components/schemas/Identifier' }
+        amountLost: { type: number, minimum: 0, description: Amount in INR }
+        incidentDate: { type: string, format: date-time }
+        isAnonymous: { type: boolean, default: false }
+    Report:
+      type: object
+      properties:
+        id: { type: string }
+        scamType: { $ref: '#/components/schemas/ScamType' }
+        title: { type: string }
+        description: { type: string }
+        identifier: { $ref: '#/components/schemas/Identifier' }
+        amountLost: { type: number }
+        status: { type: string, enum: [pending, verified, rejected] }
+        isAnonymous: { type: boolean }
+        upvoteCount: { type: integer }
+        commentCount: { type: integer }
+        evidenceCount: { type: integer }
+        reporter:
+          type: object
+          nullable: true
+          properties:
+            id: { type: string }
+            name: { type: string }
+        evidence:
+          type: array
+          description: Only returned to the reporter and to staff
+          items: { type: object }
+        createdAt: { type: string, format: date-time }
+    Session:
+      type: object
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        tokenType: { type: string, example: Bearer }
+        expiresIn: { type: string, example: 15m }
+    RiskAssessment:
+      type: object
+      properties:
+        identifier: { type: object }
+        riskScore: { type: integer, minimum: 0, maximum: 100, example: 78 }
+        riskLevel: { type: string, enum: [low, medium, high, critical] }
+        confidence: { type: string, enum: [low, medium, high] }
+        summary: { type: object }
+        breakdown:
+          type: object
+          description: Points contributed by each scoring component, with its maximum
+        signals: { type: array, items: { type: string } }
+        recommendation: { type: string }
+  responses:
+    Unauthorized:
+      description: Missing or invalid access token
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Not allowed for this role or resource
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Resource not found
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    ValidationError:
+      description: Request failed validation
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Create an account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              properties:
+                name: { type: string, example: Aarav Sharma }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8, description: At least one letter and one digit }
+      responses:
+        '201': { description: Account created, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '409': { description: Email already registered }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      description: Five failed attempts lock the account for 15 minutes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string }
+                password: { type: string }
+      responses:
+        '200': { description: Logged in }
+        '401': { description: Invalid credentials }
+        '423': { description: Account temporarily locked }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Exchange a refresh token for a new token pair
+      description: Refresh tokens are single use. Reusing one revokes every session of that user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200': { description: New token pair }
+        '401': { description: Invalid, expired or reused token }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke a refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '204': { description: Logged out }
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Current user }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/me/password:
+    patch:
+      tags: [Auth]
+      summary: Change password
+      description: Revokes all existing sessions and returns a fresh token pair.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string }
+                newPassword: { type: string }
+      responses:
+        '200': { description: Password changed }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /reports:
+    get:
+      tags: [Reports]
+      summary: Search verified reports
+      description: Public feed. Staff may pass `status` to see other states.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - { name: q, in: query, schema: { type: string }, description: Full text search over title and description }
+        - { name: scamType, in: query, schema: { $ref: '#/components/schemas/ScamType' } }
+        - { name: identifierKind, in: query, schema: { $ref: '#/components/schemas/IdentifierKind' } }
+        - { name: identifier, in: query, schema: { type: string }, description: Requires identifierKind }
+        - { name: minAmount, in: query, schema: { type: number } }
+        - { name: maxAmount, in: query, schema: { type: number } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: status, in: query, schema: { type: string, enum: [pending, verified, rejected, all] } }
+        - { name: sort, in: query, schema: { type: string, enum: [newest, oldest, mostUpvoted, highestLoss, relevance] } }
+      responses:
+        '200': { description: Page of reports }
+    post:
+      tags: [Reports]
+      summary: File a report
+      description: Limited to 10 per hour per user. The same user cannot report the same identifier twice for the same scam type.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ReportInput' } } }
+      responses:
+        '201': { description: Created. `similarReports` tells how many others already reported this identifier }
+        '409': { description: Duplicate report }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /reports/mine:
+    get:
+      tags: [Reports]
+      summary: Reports filed by the current user, in any status
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - { name: status, in: query, schema: { type: string, enum: [pending, verified, rejected] } }
+      responses:
+        '200': { description: Page of reports }
+  /reports/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Reports]
+      summary: Get a report
+      description: Non-verified reports are visible only to their author and staff.
+      responses:
+        '200': { description: The report, content: { application/json: { schema: { $ref: '#/components/schemas/Report' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Reports]
+      summary: Edit your report
+      description: Only pending or rejected reports can be edited. Editing a rejected report sends it back to the moderation queue.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ReportInput' } } }
+      responses:
+        '200': { description: Updated report }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: Report is verified and locked }
+    delete:
+      tags: [Reports]
+      summary: Delete a report
+      description: Owners can delete pending or rejected reports. Admins can delete any report and the action is audited.
+      security: [{ bearerAuth: [] }]
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /reports/{id}/evidence:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Reports]
+      summary: Upload evidence
+      description: Up to 5 files per report (JPEG, PNG, WebP, PDF). File contents are checked against their declared type.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                files:
+                  type: array
+                  items: { type: string, format: binary }
+      responses:
+        '201': { description: Evidence stored }
+        '413': { description: File too large }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /reports/{id}/evidence/{evidenceId}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+      - $ref: '#/components/parameters/EvidenceId'
+    get:
+      tags: [Reports]
+      summary: Download an evidence file (reporter and staff only)
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: The file }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Reports]
+      summary: Remove an evidence file
+      security: [{ bearerAuth: [] }]
+      responses:
+        '204': { description: Removed }
+  /reports/{id}/upvote:
+    post:
+      tags: [Community]
+      summary: Toggle your upvote on a verified report
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Returns `upvoted` and the new `upvoteCount` }
+        '403': { description: You cannot upvote your own report }
+  /reports/{id}/comments:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Community]
+      summary: List comments on a verified report
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Page of comments }
+    post:
+      tags: [Community]
+      summary: Comment on a verified report
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string, maxLength: 1000 }
+      responses:
+        '201': { description: Comment created }
+  /comments/{id}:
+    delete:
+      tags: [Community]
+      summary: Delete a comment (author or staff)
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: Deleted }
+
+  /risk/check:
+    post:
+      tags: [Risk]
+      summary: Assess the risk of an identifier
+      description: |
+        Public endpoint, limited to 30 requests per minute per IP. The score (0-100) combines report volume weighted by
+        verification status and age, financial impact, community upvotes, recent momentum, and static pattern checks on the identifier.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/Identifier' } } }
+      responses:
+        '200': { description: Assessment, content: { application/json: { schema: { $ref: '#/components/schemas/RiskAssessment' } } } }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /risk/check/bulk:
+    post:
+      tags: [Risk]
+      summary: Assess up to 10 identifiers at once
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  maxItems: 10
+                  items: { $ref: '#/components/schemas/Identifier' }
+      responses:
+        '200': { description: One result or error per item }
+
+  /stats/overview:
+    get:
+      tags: [Stats]
+      summary: Public statistics computed from verified reports
+      parameters:
+        - { name: months, in: query, schema: { type: integer, minimum: 1, maximum: 24, default: 6 } }
+        - { name: top, in: query, schema: { type: integer, minimum: 1, maximum: 25, default: 10 } }
+      responses:
+        '200': { description: Totals, breakdowns by scam type and identifier kind, most reported identifiers, monthly trend }
+
+  /moderation/queue:
+    get:
+      tags: [Moderation]
+      summary: Pending reports, oldest first
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200': { description: Page of pending reports }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /moderation/reports/{id}:
+    patch:
+      tags: [Moderation]
+      summary: Verify or reject a pending report
+      description: A note is required when rejecting. Moderators cannot review their own reports. The decision is audited.
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [verified, rejected] }
+                note: { type: string, maxLength: 500 }
+      responses:
+        '200': { description: Reviewed report }
+        '409': { description: Report is no longer pending }
+
+  /admin/dashboard:
+    get:
+      tags: [Admin]
+      summary: Operational dashboard
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Report counts by status, queue age, average review time, user counts, reports per day }
+  /admin/users:
+    get:
+      tags: [Admin]
+      summary: List users
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - { name: q, in: query, schema: { type: string } }
+        - { name: role, in: query, schema: { type: string, enum: [user, moderator, admin] } }
+        - { name: status, in: query, schema: { type: string, enum: [active, suspended] } }
+      responses:
+        '200': { description: Page of users }
+  /admin/users/{id}/role:
+    patch:
+      tags: [Admin]
+      summary: Change a user's role
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { type: string, enum: [user, moderator, admin] }
+      responses:
+        '200': { description: Updated user }
+  /admin/users/{id}/status:
+    patch:
+      tags: [Admin]
+      summary: Suspend or reactivate a user
+      description: Suspending a user also revokes all of their sessions.
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [active, suspended] }
+      responses:
+        '200': { description: Updated user }
+  /admin/audit-logs:
+    get:
+      tags: [Admin]
+      summary: Audit trail of moderation and admin actions
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - { name: action, in: query, schema: { type: string } }
+        - { name: actor, in: query, schema: { type: string } }
+        - { name: entityType, in: query, schema: { type: string, enum: [Report, User] } }
+      responses:
+        '200': { description: Page of audit entries }
